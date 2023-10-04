@@ -1,0 +1,552 @@
+---
+title: "Olink Analysis "
+author: "Shuntai Zhou"
+output:
+  html_document:
+    df_print: tibble
+    toc: true
+    toc_float: true
+    theme: sandstone
+    highlight: haddock
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: sentence
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F, message = F )
+```
+
+```{r}
+library(tidyverse)
+library(OlinkAnalyze)
+library(readxl)
+library(patchwork)
+
+```
+
+## Import data 
+
+
+```{r}
+data <- read_csv("data.csv")
+```
+
+
+```{r, eval = F}
+data$PlateID %>% unique()
+```
+
+```{r, eval = F}
+p44 <- data %>% filter (PlateID == "20201017_SS200044_CARDIO_INF" | PlateID == "20201017_SS200044_NEURO_ONC")
+p45 <- data %>% filter (PlateID == "20201017_SS200045_NEURO_ONC" | PlateID == "20201017_SS200045_CARDIO_INF")
+p47 <- data %>% filter (PlateID == "20201017_SS200047_CARDIO_INF" | PlateID == "20201017_SS200047_NEURO_ONC")
+p48 <- data %>% filter (PlateID == "20201017_SS200048_NEURO_ONC" | PlateID == "20201017_SS200048_NEURO_ONC")
+```
+
+```{r, eval = F}
+data$SampleID %>% unique() %>% sort()
+```
+
+```{r, eval = F}
+intersect(p44$SampleID, p45$SampleID)
+intersect(p47$SampleID, p48$SampleID)
+intersect(p44$SampleID, p47$SampleID)
+intersect(p48$SampleID, p45$SampleID)
+```
+
+```{r, eval = F}
+data %>% filter(Assay == "SMOC2",
+                NPX == -0.7636)
+
+data %>% filter(Assay == "SMPD1",
+                NPX == -0.394)
+```
+
+Join the key table with the olink data table
+
+```{r}
+key <- read_csv('PID_key.csv')
+
+joined_data <- data %>% full_join(key) 
+
+joined_data <- joined_data %>% filter(!is.na(Group))
+
+joined_data %>% mutate (
+  group = case_when(
+    Group == 1 ~ "Group 1", 
+    Group == 2 ~ "Group 2", 
+    .default = "Group 3&4"
+  )
+) -> joined_data
+```
+
+## PCA plot 
+
+```{r}
+joined_data %>% 
+  olink_pca_plot(df = .,
+                 color_g = "QC_Warning", byPanel = TRUE)  
+```
+
+
+## One way non-parametric poc-hoc analysis for all groups
+
+
+```{r}
+joined_data %>% 
+  olink_one_non_parametric(
+    variable = "group",
+    subject = "PID"
+  ) -> all_group_comparison
+
+all_group_comparison %>% filter(
+  Threshold == 'Significant'
+) %>% select(OlinkID) %>% 
+  pull() -> significant_assays
+
+joined_data %>% 
+  olink_one_non_parametric_posthoc(
+    variable = "group", 
+    olinkid_list = significant_assays
+  ) -> posthoc_results 
+
+write_csv(posthoc_results, "comparisons/posthoc_results_all_comparisons.csv")
+
+posthoc_results %>% filter(Threshold == 'Significant') -> posthoc_results_significant
+```
+
+
+## Compare group 1 vs group 3&4
+
+```{r}
+data1 <- joined_data %>% filter(
+  group != "Group 2"
+)
+```
+
+### non-parametricf comparisons 
+
+```{r}
+data1 %>% olink_one_non_parametric(
+    variable = "group",
+    subject = "PID") -> group1vs34 
+
+write_csv(group1vs34, "comparisons/group1vs34.csv")
+```
+
+
+### pathway enrichment
+
+```{r}
+
+ttest_results1 <- olink_ttest(
+  df = data1,
+  variable = "group",
+  alternative = "two.sided")
+
+
+gsea_results1 <- olink_pathway_enrichment(data = data1, test_results = ttest_results1)
+ora_results1 <- olink_pathway_enrichment(
+  data = data1,
+  test_results = ttest_results1, method = "ORA")
+
+write_csv(gsea_results1, "comparisons/gsea_results_1vs34.csv")
+write_csv(ora_results1, "comparisons/ora_results_1vs34.csv")
+
+```
+
+
+
+```{r}
+theme_set(theme_bw(base_family = "ArialNarrow") + 
+            theme(axis.title.y = element_blank(),
+                  axis.text.y = element_text(size = 8)))
+number_pathways_to_show = 15
+```
+
+Plot GSEA and ORA plots
+
+```{r}
+
+gsea_ora_plot <- function(gsea_results, ora_results) {
+  list_size = gsea_results %>% nrow()
+
+  for (i in 1:list_size) {
+    gsea_results$Count[i] = gsea_results$core_enrichment[i] %>% str_split_1("/") %>% length()
+  }
+  
+  gsea_results <- gsea_results %>% mutate(
+    Description = str_replace_all(Description, "_", " ")
+  )
+  ora_results$Gene_Ratio <- sapply(ora_results$GeneRatio, function(x) eval(parse(text = x))) 
+  
+  ora_results <- ora_results %>% mutate(
+    Description = str_replace_all(Description, "_", " ")
+  )
+  
+  gsea_results_head <- gsea_results  %>% head(number_pathways_to_show) %>% arrange(desc(NES))
+
+  gsea_results_head %>% 
+    ggplot(aes(x = NES, y = Description, color = p.adjust)) + 
+    geom_point(aes(size = Count)) + 
+    scale_y_discrete(limits = gsea_results_head$Description %>% rev(), 
+                     labels = function(x) str_wrap(x, width = 30, whitespace_only = F)) +
+    scale_colour_gradient(high = "#833ab4", low = "#fcb045") + 
+    scale_size_continuous(range = c(3,6)) +
+    labs(title = "Gene Set Enrichment\nAnalysis") -> gsea_plot
+  
+  ora_results_head <- ora_results  %>% head(number_pathways_to_show) %>% arrange(desc(Gene_Ratio))
+  
+  ora_results_head %>% 
+    ggplot(aes(x = Gene_Ratio, y = Description, color = p.adjust)) + 
+    geom_point(aes(size = Count)) + 
+    scale_y_discrete(limits = ora_results_head$Description %>% rev(), 
+                     labels = function(x) str_wrap(x, width = 30, whitespace_only = F)) +
+    scale_colour_gradient(high = "#833ab4", low = "#fcb045") + 
+    scale_size_continuous(range = c(3,6))  + 
+    labs(x = "Gene Ratio", 
+         title = "Over-representation\nAnalysis") -> ora_plot
+  
+  gsea_plot + ora_plot
+  
+}
+
+```
+
+
+
+
+
+```{r, fig.width=10, fig.height=10}
+p <- gsea_ora_plot(gsea_results1, ora_results1) + 
+  plot_annotation(title = "GSEA and ORA analysis between Group 1 and Group 3&4", 
+                    subtitle = paste(number_pathways_to_show, "Pathways with lowest p.adjust values"))
+
+p 
+
+ggsave("figures/pathway_1vs34.png", p, width = 12, height = 8)
+```
+
+
+## Compare group 2 vs group 3&4
+
+```{r}
+data2 <- joined_data %>% filter(
+  group != "Group 1"
+)
+```
+
+### non-parametricf comparisons 
+
+```{r}
+data2 %>% olink_one_non_parametric(
+    variable = "group",
+    subject = "PID") -> group2vs34 
+
+write_csv(group2vs34, "comparisons/group2vs34.csv")
+```
+
+### pathway enrichment
+
+```{r}
+
+ttest_results2 <- olink_ttest(
+  df = data2,
+  variable = "group",
+  alternative = "two.sided")
+
+
+gsea_results2 <- olink_pathway_enrichment(data = data2, test_results = ttest_results2)
+ora_results2 <- olink_pathway_enrichment(
+  data = data2,
+  test_results = ttest_results2, method = "ORA")
+
+write_csv(gsea_results2, "comparisons/gsea_results_2vs34.csv")
+write_csv(ora_results2, "comparisons/ora_results_2vs34.csv")
+
+```
+Plot GSEA and ORA plots
+
+```{r, fig.width=10, fig.height=10}
+p <- gsea_ora_plot(gsea_results2, ora_results2) + 
+  plot_annotation(title = "GSEA and ORA analysis between Group 2 and Group 3&4", 
+                    subtitle = paste(number_pathways_to_show, "Pathways with lowest p.adjust values"))
+
+p 
+
+ggsave("figures/pathway_2vs34.png", p, width = 12, height = 8)
+```
+### Vocalno plots for Group 1 vs Group 3&4
+
+```{r, fig.width= 8, fig.height= 8}
+top_10_name <- ttest_results1 %>%
+  slice_head(n = 10) %>%
+  pull(OlinkID)
+
+olink_volcano_plot(p.val_tbl = ttest_results1,
+                   x_lab = 'Differences between Group 1 and Group 3&4\nGroup 1 minus Group 3&4',
+                   olinkid_list = top_10_name)
+
+ggsave("figures/vocalno_1vs34.tiff", width = 8, height = 8)
+```
+
+### bar plots for up-regulated and down-regulated makers for Group 1 vs Group 3&4
+
+```{r}
+
+updown_bar <- function(ttest_results) {
+  top10_upreg <- ttest_results %>% 
+    filter(estimate > 0) %>% slice_head(n = 10)
+  
+  top10_dnreg <- ttest_results %>% 
+    filter(estimate < 0) %>% slice_head(n = 10)
+  
+  up_and_down <- rbind(top10_upreg, top10_dnreg)
+  
+  up_and_down <- up_and_down %>% arrange(desc(estimate))
+  
+  up_and_down %>% ggplot(aes(x = estimate, y = Assay, fill = Adjusted_pval)) + 
+    geom_col() + 
+    scale_y_discrete(limits = rev(up_and_down$Assay)) + 
+    scale_fill_gradient(name = "adjusted\np value", high = "#833ab4", low = "#fcb045")
+}
+
+p <- updown_bar(ttest_results1) + 
+  labs(title = "Top 10 up-regulated and down-regulated markers\nby adjusted p values", 
+       subtitle = "Group 1 vs. Group 3&4\n(estimates from group 1 minus estimates from group 3&4)")
+
+p
+
+ggsave("figures/updown_1vs34.tiff", width = 5, height = 5)
+```
+
+### Vocalno plots for Group 2 vs Group 3&4
+
+```{r, fig.width= 8, fig.height= 8}
+top_10_name <- ttest_results2 %>%
+  slice_head(n = 10) %>%
+  pull(OlinkID)
+
+olink_volcano_plot(p.val_tbl = ttest_results2,
+                   x_lab = 'Differences between Group 2 and Group 3&4\nGroup 2 minus Group 3&4',
+                   olinkid_list = top_10_name)
+
+ggsave("figures/vocalno_2vs34.tiff", width = 8, height = 8)
+```
+
+
+### bar plots for up-regulated and down-regulated makers for Group 2 vs Group 3&4
+
+```{r}
+
+
+p <- updown_bar(ttest_results2) + 
+  labs(title = "Top 10 up-regulated and down-regulated markers\nby adjusted p values", 
+       subtitle = "Group 2 vs. Group 3&4\n(estimates from group 2 minus estimates from group 3&4)")
+
+p
+
+ggsave("figures/updown_2vs34.tiff", width = 5, height = 5)
+```
+
+
+## Comparison between group 2 and group 1
+
+
+### Pathway enrichment
+```{r}
+
+data3 <- joined_data %>% filter(
+  group != "Group 3&4"
+)
+
+data3 <- data3 %>% mutate(
+  group = group %>% factor(levels = c("Group 2", "Group 1"))
+)
+
+ttest_results3 <- olink_ttest(
+  df = data3,
+  variable = "group",
+  alternative = "two.sided")
+
+
+gsea_results3 <- olink_pathway_enrichment(data = data3, test_results = ttest_results3)
+#ora_results3 <- olink_pathway_enrichment(
+  #data = data3,
+  #test_results = ttest_results3, method = "ORA")
+
+write_csv(gsea_results3, "comparisons/gsea_results_2vs1.csv")
+#write_csv(ora_results3, "comparisons/ora_results_1vs2.csv")
+
+list_size = gsea_results3 %>% nrow()
+
+for (i in 1:list_size) {
+  gsea_results3$Count[i] = gsea_results3$core_enrichment[i] %>% str_split_1("/") %>% length()
+}
+
+gsea_results3 <- gsea_results3 %>% mutate(
+  Description = str_replace_all(Description, "_", " ")
+)
+
+
+gsea_results_head <- gsea_results3  %>% 
+  filter(p.adjust <= 0.05) %>% 
+  head(number_pathways_to_show) %>% arrange(desc(NES))
+
+gsea_results_head %>% 
+  ggplot(aes(x = NES, y = Description, color = p.adjust)) + 
+  geom_point(aes(size = Count)) + 
+  scale_y_discrete(limits = gsea_results_head$Description %>% rev(), 
+                   labels = function(x) str_wrap(x, width = 40, whitespace_only = F)) +
+  scale_colour_gradient(high = "#833ab4", low = "#fcb045") + 
+  scale_size_continuous(range = c(1,4)) +
+  labs(title = "Gene Set Enrichment Analysis", 
+       subtitle = "Group 2 vs. Group 1") -> gsea_plot
+
+
+gsea_plot
+
+ggsave("figures/gsea_plot_2vs1.png", height = 6, width = 5)
+```
+
+```{r}
+olink_volcano_plot <- function (p.val_tbl, x_lab = "Estimate", olinkid_list = NULL, ...)
+{
+
+  #checking ellipsis
+  if(length(list(...)) > 0){
+
+    ellipsis_variables <- names(list(...))
+
+    if(length(ellipsis_variables) == 1){
+
+      if(!(ellipsis_variables == 'coloroption')){
+
+        stop(paste0('The ... option only takes the coloroption argument. ... currently contains the variable ',
+                    ellipsis_variables,
+                    '.'))
+
+      }
+
+    }else{
+
+      stop(paste0('The ... option only takes one argument. ... currently contains the variables ',
+                  paste(ellipsis_variables, collapse = ', '),
+                  '.'))
+    }
+  }
+
+  if(is.null(olinkid_list)){
+
+    olinkid_list <- p.val_tbl %>%
+      dplyr::filter(Threshold == 'Significant') %>%
+      dplyr::pull(OlinkID)
+
+  }
+
+
+  volcano_plot <- p.val_tbl %>%
+    ggplot2::ggplot(ggplot2::aes(x = estimate, y = -log10(Adjusted_pval),
+                                 color = Threshold)) +
+    ggplot2::geom_point() +
+    ggplot2::labs(x = x_lab, y = "-log10(adjusted p-value)") +
+    ggrepel::geom_label_repel(data = subset(p.val_tbl, OlinkID %in% olinkid_list),
+                              ggplot2::aes(label = Assay), box.padding = 1, 
+                              color = "black", show.legend = FALSE) +
+    ggplot2::geom_hline(yintercept = -log10(0.05), linetype="dotted") +
+    OlinkAnalyze::set_plot_theme() +
+    OlinkAnalyze::olink_color_discrete(...)  + 
+    theme(axis.title.x = element_text(size = 20),
+          axis.text.x = element_text(size = 14),
+          axis.title.y = element_text(size = 20), 
+          axis.text.y = element_text(size = 14),)
+
+
+  return(volcano_plot)
+
+}
+```
+
+
+
+### Volcano plot for group 2 vs group 1
+
+```{r, fig.width= 8, fig.height= 8}
+top_10_name <- ttest_results3 %>%
+  slice_head(n = 10) %>%
+  pull(OlinkID)
+
+olink_volcano_plot(p.val_tbl = ttest_results3,
+                   x_lab = 'Differences between Group 2 and Group 1\nGroup 2 minus Group 1',
+                   olinkid_list = top_10_name) 
+ 
+ggsave("figures/vocalno_2vs1.pdf", width = 8, height = 8)
+```
+
+
+## compare group 1&2 vs group 3&4
+
+```{r}
+data4 <- joined_data %>% mutate(
+  group = ifelse (group == "Group 3&4", group, "Group 1&2"), 
+  group = group %>% factor()
+)
+
+ttest_results4 <- olink_ttest(
+  df = data4,
+  variable = "group",
+  alternative = "two.sided")
+```
+
+```{r}
+top_10_name <- ttest_results4 %>%
+  slice_head(n = 10) %>%
+  pull(OlinkID)
+
+olink_volcano_plot(p.val_tbl = ttest_results4,
+                   x_lab = 'Differences between Group 1&2 and Group 3&4\nGroup 1&2 minus Group 3&4',
+                   olinkid_list = top_10_name)
+
+ggsave("figures/vocalno_12vs34.pdf", width = 8, height = 8)
+```
+
+```{r}
+
+p <- updown_bar(ttest_results4) + 
+  labs(title = "Top 10 up-regulated and down-regulated markers\nby adjusted p values", 
+       subtitle = "Group 1&2 vs. Group 3&4\n(estimates from group 1&2 minus estimates from group 3&4)")
+
+p
+
+ggsave("figures/updown_12vs34.svg", width = 5, height = 5)
+
+
+
+
+```
+### group 12 vs 34, gsea and ora
+
+```{r}
+gsea_results4 <- olink_pathway_enrichment(data = data4, test_results = ttest_results4)
+ora_results4 <- olink_pathway_enrichment(
+  data = data4,
+  test_results = ttest_results4, method = "ORA")
+
+
+```
+                                                                                                                                                                                             
+```{r}
+number_pathways_to_show = 8
+p <- gsea_ora_plot(gsea_results4, ora_results4) + 
+  plot_annotation(title = "GSEA and ORA analysis between Group 1&2 and Group 3&4", 
+                    subtitle = paste(number_pathways_to_show, "Pathways with lowest p.adjust values"))
+
+p 
+
+ggsave("figures/pathway_12vs34.png", p, width = 12, height = 8)
+```
+                                                                                                                                                                                             
+                                                                                                                                                                                             
